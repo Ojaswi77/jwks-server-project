@@ -1,121 +1,106 @@
-import jwt
+from flask import Flask, jsonify, request
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
-from datetime import datetime, timedelta, timezone
-import json
-from flask import Flask, jsonify, request
+from cryptography.hazmat.backends import default_backend
+import jwt
+import datetime
 
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "Welcome to the JWKS Server!"
+# Dictionary to hold RSA keys and their expiry times
+key_store = {}
 
-def generate_rsa_key():
-    # Generate a new RSA key pair
-    key = rsa.generate_private_key(
+def create_rsa_key():
+    # Generate a new RSA private key
+    private_key = rsa.generate_private_key(
         public_exponent=65537,
-        key_size=2048
+        key_size=2048,
+        backend=default_backend()
     )
+    public_key = private_key.public_key()
 
-    # Serialize the private key in PEM format (for signing JWTs)
-    private_key = key.private_bytes(
+    # Convert the keys into PEM format (Public and Private)
+    private_pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
         encryption_algorithm=serialization.NoEncryption()
     )
-
-    # Serialize the public key in PEM format (for serving in JWKS endpoint)
-    public_key = key.public_key().public_bytes(
+    public_pem = public_key.public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo
     )
+    return private_pem, public_pem
 
-    # Generate a Key ID (kid) using the current timestamp
-    kid = str(datetime.now(timezone.utc).timestamp())
-
-    # Set the expiry of the key (e.g., 1 day from now)
-    expiry = datetime.now(timezone.utc) + timedelta(days=1)
-
-    return private_key, public_key, kid, expiry
-
-# Dictionary to store keys (private and public), key IDs, and expiry times
-keys_store = []
-
-# Function to add keys to the key store
+# Create and store RSA keys with expiration times and key IDs (kids)
 def add_key_to_store():
-    private_key, public_key, kid, expiry = generate_rsa_key()
-
-    # Add a valid key (expiry set for 1 day in the future)
-    keys_store.append({
+    kid = str(len(key_store) + 1)
+    private_key, public_key = create_rsa_key()
+    expiry_time = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)  # Key expires in 10 minutes
+    key_store[kid] = {
         'private_key': private_key,
         'public_key': public_key,
-        'kid': kid,
-        'expiry': expiry
-    })
+        'expiry': expiry_time
+    }
+    return kid
 
-    # Add an expired key for testing (expiry set in the past)
-    expired_private_key, expired_public_key, expired_kid, expired_expiry = generate_rsa_key()
-    expired_expiry = datetime.now(timezone.utc) - timedelta(days=1)  # Set expiry to 1 day in the past
-    keys_store.append({
-        'private_key': expired_private_key,
-        'public_key': expired_public_key,
-        'kid': expired_kid,
-        'expiry': expired_expiry
-    })
-
-    print(f"Added valid key with kid {kid}, expiry {expiry}")
-    print(f"Added expired key with kid {expired_kid}, expiry {expired_expiry}")
-
-# Add keys to the store at startup
-add_key_to_store()
-
-@app.route('/jwks', methods=['GET'])
+@app.route('/.well-known/jwks.json', methods=['GET'])
 def jwks():
-    # Only return unexpired public keys
-    public_keys = [
-        {
-            "kid": key["kid"],
-            "kty": "RSA",
-            "use": "sig",
-            "alg": "RS256",
-            "n": key["public_key"].decode('utf-8').replace("\n", "").strip(),
-            "e": "AQAB"
-        }
-        for key in keys_store if key["expiry"] > datetime.now(timezone.utc)
-    ]
+    # Create a JSON Web Key Set (JWKS) response
+    jwks_response = {
+        "keys": []
+    }
+    
+    for kid, key_data in key_store.items():
+        # Only return keys that haven't expired
+        if key_data['expiry'] > datetime.datetime.utcnow():
+            public_key = key_data['public_key']
 
-    return jsonify({"keys": public_keys})
+            # Extract 'n' and 'e' values from the public RSA key
+            public_numbers = serialization.load_pem_public_key(
+                public_key,
+                backend=default_backend()
+            ).public_numbers()
+
+            jwk = {
+                "kid": kid,
+                "kty": "RSA",
+                "alg": "RS256",
+                "use": "sig",
+                "n": jwt.utils.base64url_encode(public_numbers.n.to_bytes((public_numbers.n.bit_length() + 7) // 8, byteorder='big')).decode('utf-8'),
+                "e": jwt.utils.base64url_encode(public_numbers.e.to_bytes((public_numbers.e.bit_length() + 7) // 8, byteorder='big')).decode('utf-8')
+            }
+            jwks_response['keys'].append(jwk)
+
+    return jsonify(jwks_response)
+
 
 @app.route('/auth', methods=['POST'])
-def auth():
-    # Check if the "expired" query parameter is present
-    expired = request.args.get('expired', default=False, type=bool)
+def authenticate():
+    expired = request.args.get('expired', 'false').lower() == 'true'
+    kid = list(key_store.keys())[0]  # Select the first key from the store
 
-    # Choose either a valid or expired key
     if expired:
-        # Find the expired key
-        key_data = next((key for key in keys_store if key["expiry"] < datetime.now(timezone.utc)), None)
+        key_data = key_store[kid]
+        expiration = datetime.datetime.utcnow() - datetime.timedelta(minutes=5)  # Set expiration in the past
     else:
-        # Find an unexpired key
-        key_data = next((key for key in keys_store if key["expiry"] > datetime.now(timezone.utc)), None)
+        key_data = key_store[kid]
+        expiration = datetime.datetime.utcnow() + datetime.timedelta(minutes=5)  # Set expiration in the future
 
-    if not key_data:
-        return jsonify({"error": "No valid key available"}), 400
-
-    # Create a JWT token (valid for 5 minutes)
+    private_key = key_data['private_key']
+    
+    # Add `kid` to the JWT header and payload
     token = jwt.encode(
-        {
-            'user': 'example',
-            'exp': datetime.now(timezone.utc) + timedelta(minutes=5) if not expired else datetime.now(timezone.utc) - timedelta(days=1)
-        },
-        key_data["private_key"],
-        algorithm='RS256',
-        headers={'kid': key_data["kid"]}
+        {"exp": expiration, "kid": kid},  # Include `kid` in the payload
+        private_key,
+        algorithm="RS256",
+        headers={"kid": kid}  # Also include `kid` in the JWT header
     )
+    
+    return jsonify({"token": token})
 
-    return jsonify({'token': token})
 
-# Start the Flask app at the end of the file
+# Automatically add an RSA key to the store on startup
+add_key_to_store()
+
 if __name__ == '__main__':
     app.run(port=8080)
