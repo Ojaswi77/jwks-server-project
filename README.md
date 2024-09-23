@@ -61,6 +61,3 @@ This project implements a simple JSON Web Key Set (JWKS) server using Python's F
 Feel free to submit issues and pull requests to improve the project.
 
 
----
-
-You can adjust and expand on this based on specific project details. Let me know if you need more customizations!# jwks-server-project
