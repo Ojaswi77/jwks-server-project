@@ -96,4 +96,4 @@ This project is for educational purposes and demonstrates implementation of:
 - API endpoint design
 - Test coverage implementation
 
-Author : Ojaswi Subedi
+Author: Ojaswi Subedi (Student ID: 11592640)
